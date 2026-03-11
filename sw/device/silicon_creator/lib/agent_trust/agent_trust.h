@@ -37,6 +37,10 @@ extern "C" {
  *
  * All patterns build on OpenTitan's key manager (DICE), lifecycle controller,
  * alert handler, and OTBN crypto accelerator.
+ *
+ * Security hardening: All security-critical comparisons use constant-time
+ * `hardened_memeq()`. All security decision branches are protected with
+ * `launder32()` and redundant `HARDENED_CHECK_*` against fault injection.
  */
 
 // ---------------------------------------------------------------------------
@@ -68,6 +72,10 @@ enum {
    * Maximum size of a task token in bytes.
    */
   kAgentTrustTaskTokenMaxBytes = 64,
+  /**
+   * Maximum number of allowed lifecycle states in an admission policy.
+   */
+  kAgentTrustMaxAllowedLcStates = 2,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,6 +88,9 @@ enum {
  * Binds the device identifier, boot measurements, lifecycle state, and
  * owner chain into a single attestation bundle that an orchestration layer
  * can verify before admitting an agent host to the swarm.
+ *
+ * IMPORTANT: This struct must be zero-initialized before population to
+ * ensure deterministic hashing (padding bytes must be zero).
  */
 typedef struct agent_trust_identity {
   /** Device identifier from OTP HW_CFG0 partition. */
@@ -101,10 +112,11 @@ typedef struct agent_trust_identity {
 /**
  * Collects the hardware identity for this agent host.
  *
- * Reads the device identifier, lifecycle state, hardware revision, and
- * generates the current DICE attestation keypair via the key manager and
- * OTBN. The key manager must have been advanced to at least the
- * OwnerIntermediateKey (CDI_0) stage before calling this function.
+ * Zero-initializes the identity structure, then reads the device identifier,
+ * lifecycle state, hardware revision, and generates the current DICE
+ * attestation keypair via the key manager and OTBN. The key manager must
+ * have been advanced to at least the OwnerIntermediateKey (CDI_0) stage
+ * before calling this function.
  *
  * @param key Descriptor for the ECC key to generate (e.g. kDiceKeyCdi0).
  * @param[out] identity Populated agent host identity structure.
@@ -115,10 +127,10 @@ rom_error_t agent_trust_identity_collect(const sc_keymgr_ecc_key_t *key,
                                          agent_trust_identity_t *identity);
 
 /**
- * Computes a SHA-256 digest over the agent host identity.
+ * Computes a SHA-256 digest over the agent host identity fields.
  *
- * This digest can be used as a compact identifier for admission control
- * decisions or included in attestation certificates.
+ * Hashes individual fields rather than the raw struct to avoid
+ * non-determinism from compiler-inserted padding bytes.
  *
  * @param identity The agent host identity to hash.
  * @param[out] digest The resulting SHA-256 digest.
@@ -173,15 +185,18 @@ rom_error_t agent_trust_seal_key_derive(
  * Validates the current device state against a sealing policy.
  *
  * Checks lifecycle state, binding values, and security version. Returns
- * kHardenedBoolTrue only if all policy conditions are met.
+ * kHardenedBoolTrue only if all policy conditions are met. All comparisons
+ * are constant-time and hardened against fault injection.
  *
  * @param policy The sealing policy to check against.
+ * @param current_security_version Current firmware security version.
  * @param[out] result kHardenedBoolTrue if the policy is satisfied.
  * @return kErrorOk on success.
  */
 OT_WARN_UNUSED_RESULT
 rom_error_t agent_trust_seal_policy_check(
-    const agent_trust_seal_policy_t *policy, hardened_bool_t *result);
+    const agent_trust_seal_policy_t *policy, uint32_t current_security_version,
+    hardened_bool_t *result);
 
 // ---------------------------------------------------------------------------
 // Pattern 3: Signed Provenance for Agent Actions
@@ -231,9 +246,9 @@ rom_error_t agent_trust_provenance_build(
 /**
  * Signs a message digest together with provenance metadata.
  *
- * The provenance record is hashed together with the caller-supplied digest
- * to produce a composite digest, which is then signed using the attestation
- * private key previously saved to OTBN's scratchpad.
+ * Uses domain-separated hashing: H(tag || len(provenance) || provenance ||
+ * len(digest) || digest) to produce a composite digest, which is then signed
+ * using the attestation private key previously saved to OTBN's scratchpad.
  *
  * Precondition: `otbn_boot_attestation_key_save()` must have been called.
  *
@@ -259,8 +274,8 @@ rom_error_t agent_trust_provenance_sign(
  */
 typedef struct agent_trust_admission_policy {
   /** Set of lifecycle states that are acceptable. */
-  lifecycle_state_t allowed_lc_states[2];
-  /** Number of entries in allowed_lc_states. */
+  lifecycle_state_t allowed_lc_states[kAgentTrustMaxAllowedLcStates];
+  /** Number of entries in allowed_lc_states (max 2). */
   size_t num_allowed_lc_states;
   /** If kHardenedBoolTrue, debug must be disabled (Prod or ProdEnd). */
   hardened_bool_t require_debug_disabled;
@@ -273,9 +288,10 @@ typedef struct agent_trust_admission_policy {
 /**
  * Evaluates the device attestation state against an admission policy.
  *
- * Checks lifecycle state, debug status, attestation key identity, and
- * firmware version. Returns kHardenedBoolTrue only if all policy
- * requirements are satisfied.
+ * Checks lifecycle state (re-read from hardware), debug status, attestation
+ * key identity, and firmware version. Returns kHardenedBoolTrue only if all
+ * policy requirements are satisfied. All comparisons are constant-time and
+ * hardened against fault injection.
  *
  * @param policy The admission policy to evaluate.
  * @param current_identity The current agent host identity.
@@ -292,19 +308,22 @@ rom_error_t agent_trust_admission_check(
 /**
  * Generates a short-lived task token bound to the current attestation state.
  *
- * The token is a keyed HMAC over the device identity, policy version, and a
- * caller-supplied nonce. It can be verified by the control plane to confirm
- * the agent was admitted at a specific point in time.
+ * The token is an HMAC-SHA256 over the device identity, policy version, and
+ * a caller-supplied nonce, keyed with the provided HMAC key (which should
+ * be derived from the key manager). It can be verified by the control plane
+ * to confirm the agent was admitted at a specific point in time.
  *
+ * @param key HMAC key for token generation (should be keymgr-derived).
  * @param identity The current agent host identity.
  * @param nonce A caller-supplied nonce for freshness.
  * @param policy_version Policy version words.
- * @param[out] token The generated task token (SHA-256 HMAC digest).
+ * @param[out] token The generated task token (HMAC-SHA256 digest).
  * @return kErrorOk on success.
  */
 OT_WARN_UNUSED_RESULT
 rom_error_t agent_trust_task_token_generate(
-    const agent_trust_identity_t *identity, const hmac_digest_t *nonce,
+    hmac_key_t key, const agent_trust_identity_t *identity,
+    const hmac_digest_t *nonce,
     const uint32_t policy_version[kAgentTrustPolicyVersionWords],
     hmac_digest_t *token);
 
@@ -318,7 +337,7 @@ rom_error_t agent_trust_task_token_generate(
 typedef enum agent_trust_tamper_event {
   /** No tamper event detected. */
   kAgentTrustTamperNone = 0,
-  /** Alert handler escalation triggered. */
+  /** Alert handler escalation triggered (caller-reported). */
   kAgentTrustTamperAlertEscalation = 1,
   /** Unexpected lifecycle state transition (e.g. debug re-enabled). */
   kAgentTrustTamperLifecycleAnomaly = 2,
@@ -345,12 +364,20 @@ typedef struct agent_trust_tamper_status {
 /**
  * Checks the device for tamper conditions.
  *
- * Inspects the lifecycle state, alert handler escalation status, and
- * validates boot measurements against expected values. If any anomaly is
- * detected, the status is set accordingly and quarantine is recommended.
+ * Inspects the lifecycle state, validates boot measurements against expected
+ * values, and incorporates caller-provided alert escalation status. The
+ * alert handler escalation state must be read by the caller using their
+ * platform-specific alert handler interface, since the silicon_creator
+ * alert driver does not expose an escalation-state query API.
+ *
+ * If any anomaly is detected, the status is set accordingly and quarantine
+ * is recommended. All comparisons are constant-time and hardened.
  *
  * @param expected_lc_state The expected lifecycle state.
  * @param expected_boot_measurement Expected boot measurement for integrity.
+ * @param alert_escalation_detected kHardenedBoolTrue if the caller has
+ *        detected an alert handler escalation event via platform-specific
+ *        means (e.g. dif_alert_handler_get_class_state).
  * @param[out] status The tamper detection result.
  * @return kErrorOk on success (even if a tamper event is detected).
  */
@@ -358,6 +385,7 @@ OT_WARN_UNUSED_RESULT
 rom_error_t agent_trust_tamper_check(
     lifecycle_state_t expected_lc_state,
     const keymgr_binding_value_t *expected_boot_measurement,
+    hardened_bool_t alert_escalation_detected,
     agent_trust_tamper_status_t *status);
 
 /**

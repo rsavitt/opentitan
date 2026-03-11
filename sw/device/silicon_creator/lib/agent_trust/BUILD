@@ -10,6 +10,7 @@ cc_library(
     hdrs = ["agent_trust.h"],
     deps = [
         "//sw/device/lib/base:hardened",
+        "//sw/device/lib/base:hardened_memory",
         "//sw/device/lib/base:memory",
         "//sw/device/silicon_creator/lib:error",
         "//sw/device/silicon_creator/lib:keymgr_binding",
