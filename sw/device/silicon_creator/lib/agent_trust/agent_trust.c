@@ -15,6 +15,7 @@
 #include "sw/device/silicon_creator/lib/drivers/lifecycle.h"
 #include "sw/device/silicon_creator/lib/error.h"
 #include "sw/device/silicon_creator/lib/otbn_boot_services.h"
+#include "sw/device/silicon_creator/lib/agent_trust/agent_trust_telemetry.h"
 
 // Provenance record format tag: "AGTP" (Agent Trust Provenance).
 static const uint8_t kProvenanceTag[kAgentTrustProvenanceTagBytes] = {
@@ -49,11 +50,23 @@ rom_error_t agent_trust_identity_collect(const sc_keymgr_ecc_key_t *key,
 
   // Generate the DICE attestation keypair via keymgr + OTBN.
   // The key manager must already be advanced to the required stage.
-  HARDENED_RETURN_IF_ERROR(sc_keymgr_state_check(key->required_keymgr_state));
-  HARDENED_RETURN_IF_ERROR(
-      otbn_boot_cert_ecc_p256_keygen(*key, &identity->pubkey_id,
-                                     &identity->pubkey));
+  rom_error_t keymgr_err =
+      sc_keymgr_state_check(key->required_keymgr_state);
+  if (keymgr_err != kErrorOk) {
+    agent_trust_telemetry_emit(kAgentTrustEventIdentityCollect,
+                               kAgentTrustOutcomeError, NULL);
+    return keymgr_err;
+  }
+  rom_error_t keygen_err = otbn_boot_cert_ecc_p256_keygen(
+      *key, &identity->pubkey_id, &identity->pubkey);
+  if (keygen_err != kErrorOk) {
+    agent_trust_telemetry_emit(kAgentTrustEventIdentityCollect,
+                               kAgentTrustOutcomeError, NULL);
+    return keygen_err;
+  }
 
+  agent_trust_telemetry_emit(kAgentTrustEventIdentityCollect,
+                             kAgentTrustOutcomeAllow, NULL);
   return kErrorOk;
 }
 
@@ -72,6 +85,9 @@ rom_error_t agent_trust_identity_digest(
                      sizeof(identity->bl0_measurement));
   hmac_sha256_process();
   hmac_sha256_final(digest);
+
+  agent_trust_telemetry_emit(kAgentTrustEventIdentityDigest,
+                             kAgentTrustOutcomeAllow, NULL);
   return kErrorOk;
 }
 
@@ -82,7 +98,14 @@ rom_error_t agent_trust_identity_digest(
 rom_error_t agent_trust_seal_key_derive(
     sc_keymgr_diversification_t diversification,
     sc_keymgr_key_type_t key_type, sc_keymgr_dest_t dest) {
-  return sc_keymgr_generate_key(dest, key_type, diversification);
+  rom_error_t err = sc_keymgr_generate_key(dest, key_type, diversification);
+  uint32_t detail[kAgentTrustTelemetryDetailWords] = {
+      (uint32_t)key_type, (uint32_t)dest, 0, 0};
+  agent_trust_telemetry_emit(
+      kAgentTrustEventSealKeyDerive,
+      err == kErrorOk ? kAgentTrustOutcomeAllow : kAgentTrustOutcomeError,
+      detail);
+  return err;
 }
 
 rom_error_t agent_trust_seal_policy_check(
@@ -93,6 +116,8 @@ rom_error_t agent_trust_seal_policy_check(
   // Fix #2: Hardened lifecycle state comparison with launder32.
   lifecycle_state_t current_lc_state = lifecycle_state_get();
   if (launder32(current_lc_state) != policy->required_lc_state) {
+    agent_trust_telemetry_emit(kAgentTrustEventSealPolicyCheck,
+                               kAgentTrustOutcomeDeny, NULL);
     return kErrorOk;
   }
   HARDENED_CHECK_EQ(current_lc_state, policy->required_lc_state);
@@ -103,6 +128,8 @@ rom_error_t agent_trust_seal_policy_check(
       policy->required_attestation_binding.data,
       ARRAYSIZE(policy->required_attestation_binding.data));
   if (launder32(attest_match) != kHardenedBoolTrue) {
+    agent_trust_telemetry_emit(kAgentTrustEventSealPolicyCheck,
+                               kAgentTrustOutcomeDeny, NULL);
     return kErrorOk;
   }
   HARDENED_CHECK_EQ(attest_match, kHardenedBoolTrue);
@@ -113,16 +140,24 @@ rom_error_t agent_trust_seal_policy_check(
       policy->required_sealing_binding.data,
       ARRAYSIZE(policy->required_sealing_binding.data));
   if (launder32(seal_match) != kHardenedBoolTrue) {
+    agent_trust_telemetry_emit(kAgentTrustEventSealPolicyCheck,
+                               kAgentTrustOutcomeDeny, NULL);
     return kErrorOk;
   }
   HARDENED_CHECK_EQ(seal_match, kHardenedBoolTrue);
 
   // Fix #8: Check minimum security version (was missing).
   if (launder32(current_security_version) < policy->min_security_version) {
+    uint32_t detail[kAgentTrustTelemetryDetailWords] = {
+        current_security_version, policy->min_security_version, 0, 0};
+    agent_trust_telemetry_emit(kAgentTrustEventSealPolicyCheck,
+                               kAgentTrustOutcomeDeny, detail);
     return kErrorOk;
   }
 
   *result = kHardenedBoolTrue;
+  agent_trust_telemetry_emit(kAgentTrustEventSealPolicyCheck,
+                             kAgentTrustOutcomeAllow, NULL);
   return kErrorOk;
 }
 
@@ -151,6 +186,8 @@ rom_error_t agent_trust_provenance_build(
   memcpy(provenance->policy_version, policy_version,
          sizeof(uint32_t) * kAgentTrustPolicyVersionWords);
 
+  agent_trust_telemetry_emit(kAgentTrustEventProvenanceBuild,
+                             kAgentTrustOutcomeAllow, NULL);
   return kErrorOk;
 }
 
@@ -176,7 +213,13 @@ rom_error_t agent_trust_provenance_sign(
   hmac_sha256_final(&composite_digest);
 
   // Sign the composite digest using the previously saved attestation key.
-  return otbn_boot_attestation_endorse(&composite_digest, sig);
+  rom_error_t sign_err =
+      otbn_boot_attestation_endorse(&composite_digest, sig);
+  agent_trust_telemetry_emit(
+      kAgentTrustEventProvenanceSign,
+      sign_err == kErrorOk ? kAgentTrustOutcomeAllow : kAgentTrustOutcomeError,
+      NULL);
+  return sign_err;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +258,8 @@ rom_error_t agent_trust_admission_check(
   // Cross-check: hardware state must match the identity struct's claim.
   // If they differ, the identity is stale or forged.
   if (launder32(hw_lc_state) != current_identity->lc_state) {
+    agent_trust_telemetry_emit(kAgentTrustEventAdmissionCheck,
+                               kAgentTrustOutcomeDeny, NULL);
     return kErrorOk;
   }
   HARDENED_CHECK_EQ(hw_lc_state, current_identity->lc_state);
@@ -222,6 +267,8 @@ rom_error_t agent_trust_admission_check(
   // Fix #9: Clamp num_allowed_lc_states to prevent out-of-bounds read.
   size_t num_states = policy->num_allowed_lc_states;
   if (num_states > kAgentTrustMaxAllowedLcStates) {
+    agent_trust_telemetry_emit(kAgentTrustEventAdmissionCheck,
+                               kAgentTrustOutcomeDeny, NULL);
     return kErrorOk;
   }
 
@@ -235,6 +282,8 @@ rom_error_t agent_trust_admission_check(
     }
   }
   if (launder32(lc_allowed) != kHardenedBoolTrue) {
+    agent_trust_telemetry_emit(kAgentTrustEventAdmissionCheck,
+                               kAgentTrustOutcomeDeny, NULL);
     return kErrorOk;
   }
   HARDENED_CHECK_EQ(lc_allowed, kHardenedBoolTrue);
@@ -244,6 +293,8 @@ rom_error_t agent_trust_admission_check(
     HARDENED_CHECK_EQ(policy->require_debug_disabled, kHardenedBoolTrue);
     hardened_bool_t debug_off = lc_state_debug_disabled(hw_lc_state);
     if (launder32(debug_off) != kHardenedBoolTrue) {
+      agent_trust_telemetry_emit(kAgentTrustEventAdmissionCheck,
+                                 kAgentTrustOutcomeDeny, NULL);
       return kErrorOk;
     }
     HARDENED_CHECK_EQ(debug_off, kHardenedBoolTrue);
@@ -254,16 +305,24 @@ rom_error_t agent_trust_admission_check(
       current_identity->pubkey_id.digest, policy->expected_pubkey_id.digest,
       ARRAYSIZE(policy->expected_pubkey_id.digest));
   if (launder32(pubkey_match) != kHardenedBoolTrue) {
+    agent_trust_telemetry_emit(kAgentTrustEventAdmissionCheck,
+                               kAgentTrustOutcomeDeny, NULL);
     return kErrorOk;
   }
   HARDENED_CHECK_EQ(pubkey_match, kHardenedBoolTrue);
 
   // Check firmware security version meets the minimum.
   if (launder32(current_security_version) < policy->min_security_version) {
+    uint32_t detail[kAgentTrustTelemetryDetailWords] = {
+        current_security_version, policy->min_security_version, 0, 0};
+    agent_trust_telemetry_emit(kAgentTrustEventAdmissionCheck,
+                               kAgentTrustOutcomeDeny, detail);
     return kErrorOk;
   }
 
   *admitted = kHardenedBoolTrue;
+  agent_trust_telemetry_emit(kAgentTrustEventAdmissionCheck,
+                             kAgentTrustOutcomeAllow, NULL);
   return kErrorOk;
 }
 
@@ -282,6 +341,9 @@ rom_error_t agent_trust_task_token_generate(
                      sizeof(uint32_t) * kAgentTrustPolicyVersionWords);
   hmac_sha256_process();
   hmac_sha256_final(token);
+
+  agent_trust_telemetry_emit(kAgentTrustEventTaskTokenGenerate,
+                             kAgentTrustOutcomeAllow, NULL);
   return kErrorOk;
 }
 
@@ -309,6 +371,10 @@ rom_error_t agent_trust_tamper_check(
     HARDENED_CHECK_EQ(alert_escalation_detected, kHardenedBoolTrue);
     status->event = kAgentTrustTamperAlertEscalation;
     status->quarantined = kHardenedBoolTrue;
+    uint32_t detail[kAgentTrustTelemetryDetailWords] = {
+        kAgentTrustTamperAlertEscalation, (uint32_t)current_lc_state, 0, 0};
+    agent_trust_telemetry_emit(kAgentTrustEventTamperCheck,
+                               kAgentTrustOutcomeDeny, detail);
     return kErrorOk;
   }
 
@@ -317,6 +383,11 @@ rom_error_t agent_trust_tamper_check(
   if (launder32(current_lc_state) != expected_lc_state) {
     status->event = kAgentTrustTamperLifecycleAnomaly;
     status->quarantined = kHardenedBoolTrue;
+    uint32_t detail[kAgentTrustTelemetryDetailWords] = {
+        kAgentTrustTamperLifecycleAnomaly, (uint32_t)current_lc_state,
+        (uint32_t)expected_lc_state, 0};
+    agent_trust_telemetry_emit(kAgentTrustEventTamperCheck,
+                               kAgentTrustOutcomeDeny, detail);
     return kErrorOk;
   }
   HARDENED_CHECK_EQ(current_lc_state, expected_lc_state);
@@ -330,11 +401,17 @@ rom_error_t agent_trust_tamper_check(
     if (launder32(boot_match) != kHardenedBoolTrue) {
       status->event = kAgentTrustTamperIntegrityFailure;
       status->quarantined = kHardenedBoolTrue;
+      uint32_t detail[kAgentTrustTelemetryDetailWords] = {
+          kAgentTrustTamperIntegrityFailure, 0, 0, 0};
+      agent_trust_telemetry_emit(kAgentTrustEventTamperCheck,
+                                 kAgentTrustOutcomeDeny, detail);
       return kErrorOk;
     }
     HARDENED_CHECK_EQ(boot_match, kHardenedBoolTrue);
   }
 
+  agent_trust_telemetry_emit(kAgentTrustEventTamperCheck,
+                             kAgentTrustOutcomeAllow, NULL);
   return kErrorOk;
 }
 
@@ -354,5 +431,9 @@ rom_error_t agent_trust_quarantine_activate(
   // This is irreversible until the next device reset.
   sc_keymgr_disable();
 
+  uint32_t detail[kAgentTrustTelemetryDetailWords] = {
+      (uint32_t)status->event, (uint32_t)status->lc_state_at_detection, 0, 0};
+  agent_trust_telemetry_emit(kAgentTrustEventQuarantineActivate,
+                             kAgentTrustOutcomeAllow, detail);
   return kErrorOk;
 }

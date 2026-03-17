@@ -5,10 +5,23 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "agent_trust_telemetry",
+    srcs = ["agent_trust_telemetry.c"],
+    hdrs = ["agent_trust_telemetry.h"],
+    deps = [
+        "//sw/device/lib/base:hardened",
+        "//sw/device/silicon_creator/lib:error",
+        "//sw/device/silicon_creator/lib/drivers:ibex",
+        "//sw/device/silicon_creator/lib/drivers:lifecycle",
+    ],
+)
+
+cc_library(
     name = "agent_trust",
     srcs = ["agent_trust.c"],
     hdrs = ["agent_trust.h"],
     deps = [
+        ":agent_trust_telemetry",
         "//sw/device/lib/base:hardened",
         "//sw/device/lib/base:hardened_memory",
         "//sw/device/lib/base:memory",
